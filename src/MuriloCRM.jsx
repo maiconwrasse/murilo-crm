@@ -6,13 +6,15 @@ import {
   Cake, PhoneCall, Reply, CalendarCheck, CalendarDays, CalendarPlus,
   TrendingUp, Trophy, DollarSign, Filter, Check
 } from "lucide-react";
+import { supabase } from "./supabaseClient";
 
 /* ============================================================
    Murilo Pneus Auto Center — CRM
    v4: agenda de horários · filtros · dashboard de gestão
    (sobre v3: múltiplos veículos · lembrete por km · status de
     contato · campanhas)
-   Persistência: window.storage (Claude) ou localStorage (prod)
+   Persistência: Supabase (base compartilhada, sync por linha)
+   Login: Supabase Auth · seed único do localStorage no 1º acesso
    ============================================================ */
 
 const THEME_CSS = `
@@ -291,22 +293,45 @@ function migrar(d) {
   return { clientes, servicos, orcamentos: d.orcamentos || [], agendamentos: d.agendamentos || [] };
 }
 
-/* ---------- storage ---------- */
-const store = {
-  async get(key) {
-    if (typeof window !== "undefined" && window.storage && window.storage.get) {
-      try { return await window.storage.get(key); } catch (e) {}
+/* ---------- camada de dados (Supabase, por linha) ---------- */
+const TABELAS = ["clientes", "servicos", "orcamentos", "agendamentos"];
+
+const db = {
+  async loadAll() {
+    const out = { clientes: [], servicos: [], orcamentos: [], agendamentos: [] };
+    for (const t of TABELAS) {
+      const { data, error } = await supabase.from(t).select("id,data");
+      if (error) { console.error("load " + t, error); continue; }
+      out[t] = (data || []).map(r => r.data);
     }
-    try { const v = localStorage.getItem(key); return v ? { key, value: v } : null; } catch (e) { return null; }
+    return out;
   },
-  async set(key, value) {
-    if (typeof window !== "undefined" && window.storage && window.storage.set) {
-      try { return await window.storage.set(key, value); } catch (e) {}
-    }
-    try { localStorage.setItem(key, value); } catch (e) {}
-    return { key, value };
+  async upsert(tabela, objs) {
+    if (!objs.length) return;
+    const rows = objs.map(o => ({ id: o.id, data: o }));
+    const { error } = await supabase.from(tabela).upsert(rows);
+    if (error) console.error("upsert " + tabela, error);
+  },
+  async remove(tabela, ids) {
+    if (!ids.length) return;
+    const { error } = await supabase.from(tabela).delete().in("id", ids);
+    if (error) console.error("delete " + tabela, error);
   },
 };
+
+// diff por id entre dois snapshots de uma coleção -> { muda, some }
+function diffColecao(antes, agora) {
+  const mapAntes = new Map((antes || []).map(o => [o.id, JSON.stringify(o)]));
+  const idsAgora = new Set();
+  const muda = [];
+  (agora || []).forEach(o => {
+    idsAgora.add(o.id);
+    if (mapAntes.get(o.id) !== JSON.stringify(o)) muda.push(o);
+  });
+  const some = [];
+  (antes || []).forEach(o => { if (!idsAgora.has(o.id)) some.push(o.id); });
+  return { muda, some };
+}
 
 /* ---------- emblema ---------- */
 function MuriloMark({ size = 40 }) {
@@ -345,6 +370,7 @@ function calcRetorno(veiculo, svcs) {
 }
 
 export default function MuriloCRM() {
+  const [session, setSession] = useState(undefined); // undefined=checando, null=deslogado
   const [view, setView] = useState("painel");
   const [carregado, setCarregado] = useState(false);
   const [clientes, setClientes] = useState([]);
@@ -352,24 +378,67 @@ export default function MuriloCRM() {
   const [orcamentos, setOrcamentos] = useState([]);
   const [agendamentos, setAgendamentos] = useState([]);
 
+  const snapRef = useRef({ clientes: [], servicos: [], orcamentos: [], agendamentos: [] });
+  const ultimoWriteRef = useRef(0);
+
+  // sessão (Supabase Auth)
   useEffect(() => {
-    (async () => {
-      try {
-        const r = await store.get(STORAGE_KEY);
-        if (r && r.value) {
-          const d = migrar(JSON.parse(r.value));
-          setClientes(d.clientes); setServicos(d.servicos); setOrcamentos(d.orcamentos); setAgendamentos(d.agendamentos);
-        }
-      } catch (e) {}
-      setCarregado(true);
-    })();
+    supabase.auth.getSession().then(({ data }) => setSession(data.session ?? null));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, s) => setSession(s ?? null));
+    return () => sub.subscription.unsubscribe();
   }, []);
 
+  const hidratar = async () => {
+    let d = await db.loadAll();
+    const vazio = !d.clientes.length && !d.servicos.length && !d.orcamentos.length && !d.agendamentos.length;
+    // seed único: se o banco está vazio, sobe os dados antigos do localStorage
+    if (vazio) {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (raw) {
+          d = migrar(JSON.parse(raw));
+          for (const tab of TABELAS) { if (d[tab] && d[tab].length) await db.upsert(tab, d[tab]); }
+        }
+      } catch (e) {}
+    }
+    snapRef.current = d;
+    setClientes(d.clientes); setServicos(d.servicos);
+    setOrcamentos(d.orcamentos); setAgendamentos(d.agendamentos);
+    setCarregado(true);
+  };
+
+  // carga inicial quando logar
+  useEffect(() => {
+    if (!session) { setCarregado(false); return; }
+    hidratar();
+  }, [session]);
+
+  // recarrega ao voltar o foco (sem realtime) — não atropela edição recém-feita
+  useEffect(() => {
+    if (!session) return;
+    const onFoco = () => {
+      if (document.visibilityState !== "visible") return;
+      if (Date.now() - ultimoWriteRef.current < 1500) return;
+      hidratar();
+    };
+    window.addEventListener("focus", onFoco);
+    document.addEventListener("visibilitychange", onFoco);
+    return () => { window.removeEventListener("focus", onFoco); document.removeEventListener("visibilitychange", onFoco); };
+  }, [session]);
+
+  // sync por linha: diff contra o último snapshot, debounced
   useEffect(() => {
     if (!carregado) return;
+    const atual = { clientes, servicos, orcamentos, agendamentos };
     const t = setTimeout(async () => {
-      try { await store.set(STORAGE_KEY, JSON.stringify({ clientes, servicos, orcamentos, agendamentos })); }
-      catch (e) { console.error("Falha ao salvar", e); }
+      ultimoWriteRef.current = Date.now();
+      for (const tab of TABELAS) {
+        const { muda, some } = diffColecao(snapRef.current[tab], atual[tab]);
+        if (muda.length) await db.upsert(tab, muda);
+        if (some.length) await db.remove(tab, some);
+      }
+      snapRef.current = atual;
+      ultimoWriteRef.current = Date.now();
     }, 300);
     return () => clearTimeout(t);
   }, [clientes, servicos, orcamentos, agendamentos, carregado]);
@@ -414,6 +483,9 @@ export default function MuriloCRM() {
   ];
   const mobItems = NAV.filter(n => n.id);
 
+  if (session === undefined) return <TelaCarregando />;
+  if (!session) return <Login />;
+
   return (
     <div className="mp-root">
       <style>{THEME_CSS}</style>
@@ -426,7 +498,10 @@ export default function MuriloCRM() {
           {NAV.map((n, i) => n.sec
             ? <div className="mp-navsec" key={"s" + i}>{n.sec}</div>
             : <NavItem key={n.id} icon={n.icon} label={n.label} on={view === n.id} onClick={() => setView(n.id)} badge={n.badge} />)}
-          <div style={{ marginTop: "auto", padding: "12px 12px 2px", fontSize: 10.5, color: "var(--txt-3)", lineHeight: 1.5 }}>Dados salvos neste navegador.</div>
+          <div style={{ marginTop: "auto", padding: "12px 12px 2px" }}>
+            <div style={{ fontSize: 10.5, color: "var(--txt-3)", lineHeight: 1.5, marginBottom: 7, wordBreak: "break-all" }}>{session.user.email}</div>
+            <button className="mp-btn ghost sm" style={{ width: "100%" }} onClick={() => supabase.auth.signOut()}>Sair</button>
+          </div>
         </nav>
 
         <main className="mp-main">
@@ -444,6 +519,44 @@ export default function MuriloCRM() {
 
       <div className="mp-mobnav">
         {mobItems.map(n => <MobNav key={n.id} icon={n.icon} label={n.label} on={view === n.id} onClick={() => setView(n.id)} badge={n.badge} />)}
+      </div>
+    </div>
+  );
+}
+
+function TelaCarregando() {
+  return <div className="mp-root"><style>{THEME_CSS}</style><div className="mp-empty" style={{ paddingTop: 160 }}>Carregando…</div></div>;
+}
+
+function Login() {
+  const [email, setEmail] = useState("");
+  const [senha, setSenha] = useState("");
+  const [erro, setErro] = useState("");
+  const [carregando, setCarregando] = useState(false);
+  const entrar = async () => {
+    if (!email.trim() || !senha) return;
+    setErro(""); setCarregando(true);
+    const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password: senha });
+    if (error) setErro("E-mail ou senha inválidos.");
+    setCarregando(false);
+  };
+  return (
+    <div className="mp-root"><style>{THEME_CSS}</style>
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 24 }}>
+        <div style={{ width: "100%", maxWidth: 360, background: "var(--surface)", border: "1px solid var(--line)", borderRadius: 16, padding: 28 }}>
+          <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 22 }}>
+            <MuriloMark size={40} />
+            <div><div className="mp-brand-name">Murilo Pneus</div><div className="mp-brand-sub">Auto Center</div></div>
+          </div>
+          <input className="mp-input" type="email" placeholder="E-mail" value={email} autoComplete="username"
+            onChange={e => setEmail(e.target.value)} />
+          <input className="mp-input" style={{ marginTop: 10 }} type="password" placeholder="Senha" value={senha} autoComplete="current-password"
+            onChange={e => setSenha(e.target.value)} onKeyDown={e => e.key === "Enter" && entrar()} />
+          {erro && <div style={{ color: "var(--red)", fontSize: 12.5, marginTop: 10 }}>{erro}</div>}
+          <button className="mp-btn" style={{ width: "100%", marginTop: 16, justifyContent: "center" }} onClick={entrar} disabled={carregando}>
+            {carregando ? "Entrando…" : "Entrar"}
+          </button>
+        </div>
       </div>
     </div>
   );
